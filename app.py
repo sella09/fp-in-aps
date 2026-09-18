@@ -44,7 +44,7 @@ def safe_sheet_name(name, used):
 
 
 # =========================================================
-# EKSTRAKSI
+# EKSTRAKSI HEADER
 # =========================================================
 def ekstrak_header(teks):
     data = {}
@@ -67,89 +67,113 @@ def ekstrak_header(teks):
     m = re.search(r"Pembeli Barang Kena Pajak/Penerima Jasa Kena Pajak:.*?Alamat\s*:\s*(.+)", teks, re.DOTALL)
     data["alamat_pembeli"] = m.group(1).strip().split("\n")[0] if m else None
 
+    # DPP - berbagai varian penulisan
     m = re.search(r"Dasar Pengenaan Pajak\s*([\d.,]+)", teks)
     data["dpp"] = parse_angka(m.group(1)) if m else None
 
-    m = re.search(r"Jumlah PPN[^0-9]*([\d.,]+)", teks)
+    # PPN - fleksibel terhadap spasi dan newline
+    m = re.search(r"Jumlah PPN[^0-9]*([\d.,]+)", teks, re.DOTALL)
     data["ppn"] = parse_angka(m.group(1)) if m else None
 
-    m = re.search(r"Jumlah PPnBM[^0-9]*([\d.,]+)", teks)
+    # PPnBM - 3 varian: PPnBM, PPNbM, PnPbM
+    m = re.search(r"Jumlah\s+P+[nN]?[bB]?[mM]?[^0-9]*([\d.,]+)", teks)
     data["ppnbm"] = parse_angka(m.group(1)) if m else None
 
     m = re.search(r"Harga Jual / Penggantian / Uang Muka / Termin\s*([\d.,]+)", teks)
     data["harga_jual_total"] = parse_angka(m.group(1)) if m else None
 
-    m = re.search(r"JAKARTA[^,]*,\s*(\d{1,2}\s+\w+\s+\d{4})", teks)
+    # Tanggal - fleksibel kota apapun
+    m = re.search(r"(?:JAKARTA|TANGERANG|KAB\.\s*TANGERANG|BOGOR|DEPOK|BEKASI|SURABAYA|BANDUNG)[^,]*,\s*(\d{1,2}\s+\w+\s+\d{4})", teks)
     data["tanggal"] = m.group(1) if m else None
 
     return data
 
 
+# =========================================================
+# EKSTRAKSI BARANG (VERSI FIX MULTI-FORMAT)
+# =========================================================
 def ekstrak_barang(teks):
     """
-    Struktur teks per item (multi-baris):
-        Washer - Part No : 11210753
-        Rp 23.441,25 x 10,00 Unit
-        Potongan Harga = Rp 0,00
-        PPnBM (0,00%) = Rp 0,00
-        234.412,50
+    Deteksi 2 format:
+    A) Satu baris panjang: "1 620000 Seragam Kerja Rp 230.000,00 x 5,00 Set ... 1.150.000,00"
+    B) Multi-baris (PDF terpisah):
+       "1 000000 Washer - Part No : 11210753"
+       "Rp 23.441,25 x 10,00 Unit"
+       "Potongan Harga = Rp 0,00"
+       "PPnBM (0,00%) = Rp 0,00"
+       "234.412,50"
     """
     items = []
+    posisi_part = [(m.start(), m) for m in re.finditer(r"-\s*Part No\s*:\s*(\S+)", teks)]
 
-    # Pola: nama + Part No di baris pertama
-    pola_part = re.compile(
-        r"^(?P<nama>.+?)\s*-\s*Part No\s*:\s*(?P<part>\S+)\s*$",
-        re.MULTILINE
+    # Apakah ada "- Part No" (format SDLG-style)?
+    if posisi_part:
+        m_end = re.search(r"Harga Jual / Penggantian", teks)
+        batas_akhir = m_end.start() if m_end else len(teks)
+
+        for i, (start, m) in enumerate(posisi_part):
+            end = posisi_part[i + 1][0] if i + 1 < len(posisi_part) else batas_akhir
+            blok = teks[start:end]
+            part_no = m.group(1).strip()
+
+            # Nama barang: ambil kata sebelum "- Part No"
+            before = teks[max(0, start - 100):start]
+            m_nama = re.search(r"(?:^|\s)\d{1,2}\s+\d{6}\s+([A-Za-z][A-Za-z0-9\s\-/\.]*?)\s*$", before)
+            if not m_nama:
+                m_nama = re.search(r"(\S+(?:\s+\S+)*?)\s*$", before)
+            nama = m_nama.group(1).strip() if m_nama else ""
+
+            m2 = re.search(r"Rp\s*([\d.,]+)\s*x\s*([\d.,]+)\s*(\w+)", blok)
+            harga = parse_angka(m2.group(1)) if m2 else None
+            qty = parse_angka(m2.group(2)) if m2 else None
+            satuan = m2.group(3).strip() if m2 else None
+
+            # Subtotal: angka setelah varian PPnBM
+            m3 = re.search(
+                r"[Pp]+[Nn]?[Bb]?[Mm]?\s*\(\s*0[,.]00%\s*\)\s*=\s*Rp\s*[\d.,]+\s*([\d.,]+)",
+                blok
+            )
+            if m3:
+                subtotal = parse_angka(m3.group(1))
+            else:
+                angka = re.findall(r"(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok)
+                subtotal = parse_angka(angka[-1]) if angka else None
+
+            items.append({
+                "nama_barang": nama,
+                "part_no": part_no,
+                "harga_satuan": harga,
+                "qty": qty,
+                "satuan": satuan,
+                "subtotal": subtotal,
+            })
+        return items
+
+    # Fallback: format NADE (tanpa Part No) - pola satu baris panjang
+    # Cari: No Kode Nama Rp harga x qty Satuan ... subtotal
+    pola = re.compile(
+        r"(?P<no>\d{1,3})\s+(?P<kode>\d{6})\s+"
+        r"(?P<nama>[A-Za-z][A-Za-z0-9\s\-/\.]*?)\s+"
+        r"Rp\s*(?P<harga>[\d.,]+)\s*x\s*(?P<qty>[\d.,]+)\s*(?P<satuan>\w+).*?"
+        r"(?P<subtotal>\d{1,3}(?:\.\d{3})+(?:,\d{2})?)",
+        re.DOTALL
     )
-
-    for m in pola_part.finditer(teks):
-        nama = m.group("nama").strip()
-        part = m.group("part").strip()
-        pos_akhir = m.end()
-
-        # Ambil ~200 karakter setelah baris Part No untuk cari harga, qty, subtotal
-        lanjutan = teks[pos_akhir:pos_akhir + 400]
-
-        # Harga & qty: "Rp 23.441,25 x 10,00 Unit"
-        m2 = re.search(
-            r"Rp\s*(?P<harga>[\d.,]+)\s*x\s*(?P<qty>[\d.,]+)\s*(?P<satuan>\w+)",
-            lanjutan
-        )
-        harga = parse_angka(m2.group("harga")) if m2 else None
-        qty = parse_angka(m2.group("qty")) if m2 else None
-        satuan = m2.group("satuan").strip() if m2 else None
-
-        # Subtotal: angka besar di akhir blok (bukan "Rp 0,00")
-        # Cari baris yang isinya HANYA angka (mungkin dengan titik/koma ribuan)
-        m3 = re.search(
-            r"^\s*(?P<subtotal>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$",
-            lanjutan, re.MULTILINE
-        )
-        subtotal = parse_angka(m3.group("subtotal")) if m3 else None
-
-        # Kalau tidak ketemu, cari angka terakhir di blok
-        if subtotal is None:
-            angka_semua = re.findall(r"(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", lanjutan)
-            if angka_semua:
-                subtotal = parse_angka(angka_semua[-1])
-
+    for m in pola.finditer(teks):
         items.append({
-            "nama_barang": nama,
-            "part_no": part,
-            "harga_satuan": harga,
-            "qty": qty,
-            "satuan": satuan,
-            "subtotal": subtotal,
+            "nama_barang": m.group("nama").strip(),
+            "part_no": m.group("kode").strip(),
+            "harga_satuan": parse_angka(m.group("harga")),
+            "qty": parse_angka(m.group("qty")),
+            "satuan": m.group("satuan").strip(),
+            "subtotal": parse_angka(m.group("subtotal")),
         })
-
     return items
 
 
 # =========================================================
-# VALIDASI
+# VALIDASI (VERSI LENTUR)
 # =========================================================
 TOLERANSI = 1.0
-TARIF_PPN = 0.11
 
 
 def validasi_satu_faktur(header, barang):
@@ -171,13 +195,14 @@ def validasi_satu_faktur(header, barang):
             ket = "OK" if status == "✅" else f"Selisih {rupiah(selisih)}"
             total_item += st_
         rows.append({
-            "Cek": f"Item {i}: {b.get('nama_barang')} ({b.get('part_no')})",
+            "Cek": f"Item {i}: {b.get('nama_barang')}",
             "Nilai": f"{rupiah(hs)} × {q}",
             "Selisih": selisih,
             "Status": status,
             "Keterangan": ket,
         })
 
+    # Total item vs Harga Jual
     if harga_jual is not None and total_item > 0:
         selisih = round(harga_jual - total_item, 2)
         status = "✅" if abs(selisih) <= TOLERANSI else "❌"
@@ -191,11 +216,23 @@ def validasi_satu_faktur(header, barang):
         "Status": status, "Keterangan": ket,
     })
 
-    if dpp is not None and ppn is not None and harga_jual is not None:
-        hitung = round(dpp + ppn + ppnbm, 2)
-        selisih = round(harga_jual - hitung, 2)
-        status = "✅" if abs(selisih) <= TOLERANSI else "❌"
-        ket = "OK" if status == "✅" else f"Selisih {rupiah(selisih)}"
+    # DPP + PPN + PPnBM vs Harga Jual (hanya cek kalau DPP mendekati Harga Jual)
+    # (kalau DPP Nilai Lain, tidak dicek - hanya info)
+    if dpp is not None and harga_jual is not None and harga_jual > 0:
+        rasio = dpp / harga_jual
+        if 0.95 <= rasio <= 1.05:
+            # DPP normal
+            if ppn is not None:
+                hitung = round(dpp + ppn + ppnbm, 2)
+                selisih = round(harga_jual - hitung, 2)
+                status = "✅" if abs(selisih) <= TOLERANSI else "❌"
+                ket = "OK" if status == "✅" else f"Selisih {rupiah(selisih)}"
+            else:
+                selisih, status, ket = None, "⚠️", "PPN tidak terbaca"
+        else:
+            # DPP Nilai Lain - info saja
+            selisih, status = None, "ℹ️"
+            ket = f"DPP Nilai Lain (rasio {rasio:.2%}) - validasi dilewati"
     else:
         selisih, status, ket = None, "⚠️", "Tidak bisa dicek"
     rows.append({
@@ -205,24 +242,21 @@ def validasi_satu_faktur(header, barang):
         "Status": status, "Keterangan": ket,
     })
 
+    # Tarif PPN efektif (hanya info, bukan validasi)
     if dpp and ppn is not None and dpp > 0:
-        harusnya = round(dpp * TARIF_PPN, 2)
-        selisih = round(ppn - harusnya, 2)
-        if abs(selisih) <= TOLERANSI:
-            status, ket = "✅", "OK"
-        elif abs(selisih) <= 2:
-            status, ket = "⚠️", f"Pembulatan {rupiah(selisih)}"
-        else:
-            status, ket = "❌", f"Selisih {rupiah(selisih)} (harusnya {rupiah(harusnya)})"
+        tarif = ppn / dpp
+        status = "ℹ️"
+        ket = f"Tarif efektif {tarif:.2%}"
     else:
-        harusnya, selisih, status, ket = None, None, "⚠️", "Tidak bisa dicek"
+        status, ket = "⚠️", "Tidak bisa dicek"
     rows.append({
-        "Cek": "Tarif PPN 11% × DPP",
-        "Nilai": f"PPN {rupiah(ppn)} vs {rupiah(harusnya)}",
-        "Selisih": selisih,
+        "Cek": "Tarif PPN Efektif",
+        "Nilai": f"PPN {rupiah(ppn)} ÷ DPP {rupiah(dpp)}",
+        "Selisih": None,
         "Status": status, "Keterangan": ket,
     })
 
+    # Kelengkapan data wajib
     wajib = ["nomor_seri", "npwp_penjual", "npwp_pembeli", "tanggal", "dpp", "ppn"]
     kosong = [k for k in wajib if not header.get(k)]
     status = "✅" if not kosong else "❌"
@@ -234,6 +268,7 @@ def validasi_satu_faktur(header, barang):
         "Status": status, "Keterangan": ket,
     })
 
+    # Status akhir: hanya ❌ kalau ada ❌, kalau hanya ℹ️/⚠️ → tetap ✅
     if any(r["Status"] == "❌" for r in rows):
         akhir = "❌ Gagal"
     elif any(r["Status"] == "⚠️" for r in rows):
@@ -346,7 +381,6 @@ if uploaded_files:
         used_names = set()
 
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            # ---------- SHEET REKAP ----------
             rekap_sheet = safe_sheet_name("Rekap", used_names)
             pd.DataFrame([["REKAP FAKTUR PAJAK"]]).to_excel(
                 writer, sheet_name=rekap_sheet, index=False, header=False
@@ -398,7 +432,6 @@ if uploaded_files:
             for col in range(1, len(df_rekap_full.columns) + 1):
                 ws.cell(row=2 + len(df_rekap_full), column=col).font = Font(bold=True)
 
-            # ---------- 1 SHEET PER FAKTUR ----------
             for r in hasil:
                 h = r["header"]
                 raw_name = h.get("nomor_seri") or h.get("nama_file", "Faktur")
