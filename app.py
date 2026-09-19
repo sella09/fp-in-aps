@@ -83,43 +83,51 @@ def ekstrak_header(teks):
 
 def ekstrak_barang(teks):
     items = []
-    posisi_part = [(m.start(), m) for m in re.finditer(r"-\s*Part No\s*:\s*(\S+)", teks)]
 
-    if posisi_part:
-        m_end = re.search(r"Harga Jual / Penggantian", teks)
-        batas_akhir = m_end.start() if m_end else len(teks)
+    # === FORMAT A: dengan "- Part No" (SDLG style) ===
+    pola_blok = re.compile(
+        r"(?P<no>\d{1,2})\s+(?P<kode>\d{6})\s+"
+        r"(?P<nama>[A-Za-z][A-Za-z0-9\s\.\-/()%]*?)\s+-\s+Part No\s*:\s*(?P<part>\S+)",
+        re.MULTILINE
+    )
+    matches = list(pola_blok.finditer(teks))
 
-        for i, (start, m) in enumerate(posisi_part):
-            end = posisi_part[i + 1][0] if i + 1 < len(posisi_part) else batas_akhir
+    if matches:
+        for i, m in enumerate(matches):
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else None
+            if end is None:
+                m_footer = re.search(r"Harga Jual / Penggantian", teks[start:])
+                end = start + m_footer.start() if m_footer else len(teks)
             blok = teks[start:end]
-            part_no = m.group(1).strip()
 
-            before = teks[max(0, start - 120):start]
-            m_nama = re.search(r"(?:^|\s)\d{1,2}\s+\d{6}\s+(.+?)\s*$", before)
-            nama = m_nama.group(1).strip() if m_nama else ""
-
-            m2 = re.search(r"Rp\s*([\d.,]+)\s*x\s*([\d.,]+)\s*(\w+)", blok)
+            m2 = re.search(r"Rp\s*([\d.,]+)\s*x\s*([\d.,]+)\s*([A-Za-z]+)", blok)
             harga = parse_angka(m2.group(1)) if m2 else None
             qty = parse_angka(m2.group(2)) if m2 else None
-            satuan = m2.group(3).strip() if m2 else None
+            satuan = m2.group(3) if m2 else None
 
-            m3 = re.search(
-                r"[Pp]+[Nn]?[Bb]?[Mm]?\s*\(\s*0[,.]00%\s*\)\s*=\s*Rp\s*[\d.,]+\s*([\d.,]+)",
-                blok
-            )
+            m3 = re.search(r"=\s*Rp\s*0[,.]00\s*(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok)
             if m3:
                 subtotal = parse_angka(m3.group(1))
             else:
-                angka = re.findall(r"(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok)
-                subtotal = parse_angka(angka[-1]) if angka else None
+                m3b = re.search(r"[Pp]+[Nn]?[Bb]?[Mm]?\s*\([^)]+\)\s*=\s*Rp\s*[\d.,]+\s*(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok)
+                if m3b:
+                    subtotal = parse_angka(m3b.group(1))
+                else:
+                    angka = re.findall(r"(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok)
+                    subtotal = parse_angka(angka[-1]) if angka else None
 
             items.append({
-                "nama_barang": nama, "part_no": part_no,
-                "harga_satuan": harga, "qty": qty,
-                "satuan": satuan, "subtotal": subtotal,
+                "nama_barang": m.group("nama").strip(),
+                "part_no": m.group("part").strip(),
+                "harga_satuan": harga,
+                "qty": qty,
+                "satuan": satuan,
+                "subtotal": subtotal,
             })
         return items
 
+    # === FORMAT B: tanpa "- Part No" (BIOSOLAR / NADE / Mandiri style) ===
     pola_awal = re.compile(
         r"(?:^|\s)(?P<no>\d{1,3})\s+(?P<kode>\d{6})\s+"
         r"(?P<nama>[A-Z][A-Za-z0-9\s\.\-/()%]+?)\s+"
@@ -139,14 +147,21 @@ def ekstrak_barang(teks):
         blok_lanjutan = teks[start:end]
 
         m_sub = re.search(
-            r"[Pp]+[Nn]?[Bb]?[Mm]?\s*\(\s*0[,.]00%\s*\)\s*=\s*Rp\s*[\d.,]+\s*([\d.,]+)",
+            r"=\s*Rp\s*0[,.]00\s*(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)",
             blok_lanjutan
         )
         if m_sub:
             subtotal = parse_angka(m_sub.group(1))
         else:
-            angka = re.findall(r"(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok_lanjutan)
-            subtotal = parse_angka(angka[-1]) if angka else None
+            m_sub2 = re.search(
+                r"[Pp]+[Nn]?[Bb]?[Mm]?\s*\(\s*0[,.]00%\s*\)\s*=\s*Rp\s*[\d.,]+\s*(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)",
+                blok_lanjutan
+            )
+            if m_sub2:
+                subtotal = parse_angka(m_sub2.group(1))
+            else:
+                angka = re.findall(r"(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok_lanjutan)
+                subtotal = parse_angka(angka[-1]) if angka else None
 
         items.append({
             "nama_barang": m.group("nama").strip(),
