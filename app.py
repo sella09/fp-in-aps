@@ -8,7 +8,7 @@ from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Ekstraktor Faktur Pajak", layout="wide")
 st.title("📄 Ekstraktor Faktur Pajak Indonesia")
-st.caption("Upload PDF faktur → Excel berisi Rekap + 1 sheet per faktur, nominal sebagai angka asli.")
+st.caption("Upload PDF faktur → Excel berisi Rekap + 1 sheet per faktur (Header + Detail Barang).")
 
 
 def parse_angka(s):
@@ -20,12 +20,6 @@ def parse_angka(s):
         return float(s)
     except ValueError:
         return None
-
-
-def rupiah(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return "-"
-    return f"Rp {x:,.0f}".replace(",", ".")
 
 
 def safe_sheet_name(name, used):
@@ -82,10 +76,11 @@ def ekstrak_header(teks):
 
 
 def ekstrak_barang(teks):
+    """Ekstrak detail barang. Subtotal diambil dari faktur (bukan hitung sendiri)."""
     items = []
 
     # === FORMAT A: dengan "- Part No" (SDLG style) ===
-    # Teks asli: "1000000Washer - Part No : 11210753 Rp 23.441,25 x 10,00 Unit Potongan Harga = Rp 0,00 PnPbM (0,00%) = Rp 0,00234.412,502000000Pin..."
+    # "1000000Washer - Part No : 11210753 Rp 23.441,25 x 10,00 Unit ... = Rp 0,00234.412,502000000Pin..."
     pola_blok = re.compile(
         r"(?P<no>\d{1,3})(?P<kode>\d{6})"
         r"(?P<nama>[A-Za-z][A-Za-z0-9\s\.\-/()%]*?)"
@@ -103,34 +98,32 @@ def ekstrak_barang(teks):
                 end = start + m_footer.start() if m_footer else len(teks)
             blok = teks[start:end]
 
-            # Harga & qty
             m2 = re.search(r"Rp\s*([\d.,]+)\s*x\s*([\d.,]+)\s*([A-Za-z]+)", blok)
             harga = parse_angka(m2.group(1)) if m2 else None
             qty = parse_angka(m2.group(2)) if m2 else None
             satuan = m2.group(3) if m2 else None
 
             # Subtotal: angka besar setelah "= Rp 0,00" (tanpa spasi)
-            # Teks asli: "= Rp 0,00234.412,50" → tangkap langsung setelah 0,00
             m3 = re.search(r"=\s*Rp\s*0[,.]00(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok)
             if m3:
                 subtotal = parse_angka(m3.group(1))
             else:
-                # Fallback: cari angka besar terakhir di blok (dengan 2 digit desimal)
                 angka = re.findall(r"(\d{1,3}(?:\.\d{3})+(?:,\d{2}))", blok)
                 subtotal = parse_angka(angka[-1]) if angka else None
 
             items.append({
-                "nama_barang": m.group("nama").strip(),
-                "part_no": m.group("part").strip(),
-                "harga_satuan": harga,
-                "qty": qty,
-                "satuan": satuan,
-                "subtotal": subtotal,
+                "No": m.group("no"),
+                "Kode": m.group("kode"),
+                "Nama Barang": m.group("nama").strip(),
+                "Part No": m.group("part").strip(),
+                "Harga Satuan": harga,
+                "Qty": qty,
+                "Satuan": satuan,
+                "Subtotal": subtotal,
             })
         return items
 
     # === FORMAT B: tanpa "- Part No" (BIOSOLAR / NADE / Mandiri style) ===
-    # Teks asli: "1382600BIOSOLAR INDUSTRI DO/03/RDE-JKI/VI/26 Rp 17.567,56 x 10.000,00 Liter Potongan Harga = Rp 0,00 PPnBM (0,00%) = Rp 0,00175.675.600,00"
     pola_awal = re.compile(
         r"(?:^|\s)(?P<no>\d{1,3})(?P<kode>\d{6})"
         r"(?P<nama>[A-Z][A-Za-z0-9\s\.\-/()%]*?)\s+"
@@ -149,7 +142,6 @@ def ekstrak_barang(teks):
 
         blok_lanjutan = teks[start:end]
 
-        # Subtotal: angka besar setelah "= Rp 0,00" (tanpa spasi)
         m_sub = re.search(r"=\s*Rp\s*0[,.]00(\d{1,3}(?:\.\d{3})+(?:,\d{2})?)", blok_lanjutan)
         if m_sub:
             subtotal = parse_angka(m_sub.group(1))
@@ -158,108 +150,16 @@ def ekstrak_barang(teks):
             subtotal = parse_angka(angka[-1]) if angka else None
 
         items.append({
-            "nama_barang": m.group("nama").strip(),
-            "part_no": m.group("kode").strip(),
-            "harga_satuan": parse_angka(m.group("harga")),
-            "qty": parse_angka(m.group("qty")),
-            "satuan": m.group("satuan").strip(),
-            "subtotal": subtotal,
+            "No": m.group("no"),
+            "Kode": m.group("kode"),
+            "Nama Barang": m.group("nama").strip(),
+            "Part No": "",
+            "Harga Satuan": parse_angka(m.group("harga")),
+            "Qty": parse_angka(m.group("qty")),
+            "Satuan": m.group("satuan").strip(),
+            "Subtotal": subtotal,
         })
     return items
-
-
-TOLERANSI = 1.0
-
-
-def validasi_satu_faktur(header, barang):
-    rows = []
-    dpp = header.get("dpp")
-    ppn = header.get("ppn")
-    ppnbm = header.get("ppnbm") or 0
-    harga_jual = header.get("harga_jual_total")
-
-    total_item = 0
-    for i, b in enumerate(barang, 1):
-        hs, q, st_ = b.get("harga_satuan"), b.get("qty"), b.get("subtotal")
-        if hs is None or q is None or st_ is None:
-            status, ket, selisih = "❌", "Data tidak lengkap", None
-        else:
-            hitung = round(hs * q, 2)
-            selisih = round(st_ - hitung, 2)
-            status = "✅" if abs(selisih) <= TOLERANSI else "❌"
-            ket = "OK" if status == "✅" else f"Selisih {rupiah(selisih)}"
-            total_item += st_
-        rows.append({
-            "Cek": f"Item {i}: {b.get('nama_barang')}",
-            "Nilai": f"{rupiah(hs)} × {q}",
-            "Selisih": selisih,
-            "Status": status, "Keterangan": ket,
-        })
-
-    if harga_jual is not None and total_item > 0:
-        selisih = round(harga_jual - total_item, 2)
-        status = "✅" if abs(selisih) <= TOLERANSI else "❌"
-        ket = "OK" if status == "✅" else f"Selisih {rupiah(selisih)}"
-    else:
-        selisih, status, ket = None, "⚠️", "Tidak bisa dicek"
-    rows.append({
-        "Cek": "Total item vs Harga Jual",
-        "Nilai": f"{rupiah(total_item)} vs {rupiah(harga_jual)}",
-        "Selisih": selisih, "Status": status, "Keterangan": ket,
-    })
-
-    if dpp is not None and harga_jual is not None and harga_jual > 0:
-        rasio = dpp / harga_jual
-        if 0.95 <= rasio <= 1.05:
-            if ppn is not None:
-                hitung = round(dpp + ppn + ppnbm, 2)
-                selisih = round(harga_jual - hitung, 2)
-                status = "✅" if abs(selisih) <= TOLERANSI else "❌"
-                ket = "OK" if status == "✅" else f"Selisih {rupiah(selisih)}"
-            else:
-                selisih, status, ket = None, "⚠️", "PPN tidak terbaca"
-        else:
-            selisih, status = None, "ℹ️"
-            ket = f"DPP Nilai Lain (rasio {rasio:.2%}) - validasi dilewati"
-    else:
-        selisih, status, ket = None, "⚠️", "Tidak bisa dicek"
-    rows.append({
-        "Cek": "DPP + PPN + PPnBM vs Harga Jual",
-        "Nilai": f"{rupiah(dpp)} + {rupiah(ppn)} + {rupiah(ppnbm)} vs {rupiah(harga_jual)}",
-        "Selisih": selisih, "Status": status, "Keterangan": ket,
-    })
-
-    if dpp and ppn is not None and dpp > 0:
-        tarif = ppn / dpp
-        status, ket = "ℹ️", f"Tarif efektif {tarif:.2%}"
-    else:
-        status, ket = "⚠️", "Tidak bisa dicek"
-    rows.append({
-        "Cek": "Tarif PPN Efektif",
-        "Nilai": f"PPN {rupiah(ppn)} ÷ DPP {rupiah(dpp)}",
-        "Selisih": None, "Status": status, "Keterangan": ket,
-    })
-
-    wajib = ["nomor_seri", "npwp_penjual", "npwp_pembeli", "tanggal", "dpp", "ppn"]
-    kosong = [k for k in wajib if not header.get(k)]
-    status = "✅" if not kosong else "❌"
-    ket = "OK" if not kosong else f"Kosong: {', '.join(kosong)}"
-    rows.append({
-        "Cek": "Kelengkapan Data Wajib",
-        "Nilai": ", ".join(wajib),
-        "Selisih": None, "Status": status, "Keterangan": ket,
-    })
-
-    if any(r["Status"] == "❌" for r in rows):
-        akhir = "❌ Gagal"
-    elif any(r["Status"] == "⚠️" for r in rows):
-        akhir = "⚠️ Perlu dicek"
-    else:
-        akhir = "✅ Valid"
-
-    rows.append({"Cek": "STATUS AKHIR", "Nilai": "", "Selisih": None,
-                 "Status": akhir, "Keterangan": ""})
-    return rows
 
 
 def proses_pdf(file):
@@ -315,7 +215,7 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    if st.button("🚀 Proses & Validasi", type="primary"):
+    if st.button("🚀 Proses", type="primary"):
         hasil = []
         progress = st.progress(0)
         status = st.empty()
@@ -324,38 +224,37 @@ if uploaded_files:
             status.text(f"Memproses: {f.name} ({i+1}/{len(uploaded_files)})")
             try:
                 h, b = proses_pdf(f)
-                v = validasi_satu_faktur(h, b)
-                hasil.append({"header": h, "barang": b, "validasi": v})
+                hasil.append({"header": h, "barang": b})
             except Exception as e:
                 st.warning(f"Gagal memproses {f.name}: {e}")
             progress.progress((i + 1) / len(uploaded_files))
         status.text("✅ Selesai!")
 
         total = len(hasil)
-        valid = sum(1 for r in hasil if r["validasi"][-1]["Status"] == "✅ Valid")
-        perlu = sum(1 for r in hasil if r["validasi"][-1]["Status"] == "⚠️ Perlu dicek")
-        gagal = sum(1 for r in hasil if r["validasi"][-1]["Status"] == "❌ Gagal")
+        total_barang = sum(len(r["barang"]) for r in hasil)
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2 = st.columns(2)
         c1.metric("Total Faktur", total)
-        c2.metric("✅ Valid", valid)
-        c3.metric("⚠️ Perlu Dicek", perlu)
-        c4.metric("❌ Gagal", gagal)
+        c2.metric("Total Barang", total_barang)
 
         for r in hasil:
             h = r["header"]
             st.markdown("---")
             st.subheader(f"📄 {h.get('nomor_seri') or h.get('nama_file')}")
-            st.caption(f"Pembeli: {h.get('nama_pembeli')} | Tanggal: {h.get('tanggal')}")
+            st.caption(f"Penjual: {h.get('nama_penjual')} | Pembeli: {h.get('nama_pembeli')} | Tanggal: {h.get('tanggal')}")
             st.markdown("**Detail Barang**")
-            st.dataframe(pd.DataFrame(r["barang"]), use_container_width=True)
-            st.markdown("**Validasi**")
-            st.dataframe(pd.DataFrame(r["validasi"]), use_container_width=True)
+            df_b = pd.DataFrame(r["barang"])
+            if not df_b.empty:
+                st.dataframe(df_b, use_container_width=True)
+            else:
+                st.warning("⚠️ Tidak ada barang yang terekstrak dari PDF ini.")
 
+        # ================= EXPORT EXCEL =================
         buffer = BytesIO()
         used_names = set()
 
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            # ---------- SHEET REKAP ----------
             rekap_sheet = safe_sheet_name("Rekap", used_names)
             pd.DataFrame([["REKAP FAKTUR PAJAK"]]).to_excel(
                 writer, sheet_name=rekap_sheet, index=False, header=False
@@ -365,8 +264,7 @@ if uploaded_files:
             rekap_rows = []
             for r in hasil:
                 h = r["header"]
-                akhir = r["validasi"][-1]["Status"]
-                total_item = sum(b.get("subtotal") or 0 for b in r["barang"])
+                total_item = sum(b.get("Subtotal") or 0 for b in r["barang"])
                 rekap_rows.append({
                     "Nomor Seri": h.get("nomor_seri"),
                     "Tanggal": h.get("tanggal"),
@@ -380,7 +278,6 @@ if uploaded_files:
                     "PPN": h.get("ppn"),
                     "PPnBM": h.get("ppnbm"),
                     "Harga Jual Total": h.get("harga_jual_total"),
-                    "Status": akhir,
                     "Nama File": h.get("nama_file"),
                 })
             df_rekap = pd.DataFrame(rekap_rows)
@@ -394,7 +291,7 @@ if uploaded_files:
                 "PPN": df_rekap["PPN"].sum() if not df_rekap.empty else 0,
                 "PPnBM": df_rekap["PPnBM"].sum() if not df_rekap.empty else 0,
                 "Harga Jual Total": df_rekap["Harga Jual Total"].sum() if not df_rekap.empty else 0,
-                "Status": "", "Nama File": "",
+                "Nama File": "",
             }])
             df_rekap_full = pd.concat([df_rekap, total_row], ignore_index=True)
 
@@ -407,6 +304,7 @@ if uploaded_files:
             for col in range(1, len(df_rekap_full.columns) + 1):
                 ws.cell(row=2 + len(df_rekap_full), column=col).font = Font(bold=True)
 
+            # ---------- 1 SHEET PER FAKTUR ----------
             for r in hasil:
                 h = r["header"]
                 raw_name = h.get("nomor_seri") or h.get("nama_file", "Faktur")
@@ -436,13 +334,7 @@ if uploaded_files:
                 row += 1
                 row = tulis_judul(writer, sheet, "DETAIL BARANG", row)
                 row = tulis_df(writer, df_barang, sheet, startrow=row,
-                               kolom_angka=["harga_satuan", "qty", "subtotal"])
-
-                df_validasi = pd.DataFrame(r["validasi"])
-                row += 1
-                row = tulis_judul(writer, sheet, "VALIDASI", row)
-                tulis_df(writer, df_validasi, sheet, startrow=row,
-                         kolom_angka=["Selisih"])
+                               kolom_angka=["Harga Satuan", "Qty", "Subtotal"])
 
                 ws = writer.sheets[sheet]
                 for col_cells in ws.columns:
@@ -456,7 +348,7 @@ if uploaded_files:
         st.download_button(
             label="⬇️ Download Excel (Rekap + 1 sheet per faktur)",
             data=buffer.getvalue(),
-            file_name="faktur_pajak_rekap.xlsx",
+            file_name="faktur_pajak.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
