@@ -76,14 +76,12 @@ def ekstrak_header(teks):
 
 
 def ekstrak_barang(teks):
-    """Ekstrak barang dari format multi-baris:
-        Washer - Part No : 11210753
-        Rp 23.441,25 x 10,00 Unit
-        1 000000 234.412,50
-        Potongan Harga = Rp 0,00
-        PPnBM (0,00%) = Rp 0,00
-    """
+    """Ekstrak barang dari format multi-baris."""
     items = []
+
+    # Buang header tabel
+    teks_bersih = re.sub(r"Kode\s+Harga Jual.*?\(Rp\)", "", teks, flags=re.DOTALL)
+    teks_bersih = re.sub(r"No\.?\s*Kode\s*Barang.*?Jasa Kena Pajak", "", teks_bersih, flags=re.DOTALL)
 
     # === FORMAT A: dengan "- Part No" (SDLG style) ===
     pola = re.compile(
@@ -92,7 +90,7 @@ def ekstrak_barang(teks):
         r"\s*(?P<no>\d{1,3})\s+(?P<kode>\d{6})\s+(?P<subtotal>[\d.,]+)",
         re.MULTILINE
     )
-    for m in pola.finditer(teks):
+    for m in pola.finditer(teks_bersih):
         items.append({
             "No": m.group("no"),
             "Kode": m.group("kode"),
@@ -107,18 +105,21 @@ def ekstrak_barang(teks):
     if items:
         return items
 
-    # === FORMAT B: tanpa "- Part No" (BIOSOLAR / NADE / Mandiri style) ===
+    # === FORMAT B: tanpa "- Part No" ===
     pola_b = re.compile(
-        r"(?P<nama>[A-Z][A-Za-z0-9\s\.\-/()%]*?)\s*\n?"
-        r"\s*Rp\s*(?P<harga>[\d.,]+)\s*x\s*(?P<qty>[\d.,]+)\s*(?P<satuan>\w+)\s*\n?"
+        r"(?P<nama>[A-Z][A-Za-z0-9\s\.\-/()%]*?)\s*\n"
+        r"\s*Rp\s*(?P<harga>[\d.,]+)\s*x\s*(?P<qty>[\d.,]+)\s*(?P<satuan>\w+)\s*\n"
         r"\s*(?P<no>\d{1,3})\s+(?P<kode>\d{6})\s+(?P<subtotal>[\d.,]+)",
         re.MULTILINE
     )
-    for m in pola_b.finditer(teks):
+    for m in pola_b.finditer(teks_bersih):
+        nama = m.group("nama").strip()
+        if any(x in nama for x in ["Harga Jual", "Nama Barang", "Kode Barang", "Kode Harga"]):
+            continue
         items.append({
             "No": m.group("no"),
             "Kode": m.group("kode"),
-            "Nama Barang": m.group("nama").strip(),
+            "Nama Barang": nama,
             "Part No": "",
             "Harga Satuan": parse_angka(m.group("harga")),
             "Qty": parse_angka(m.group("qty")),
