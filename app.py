@@ -79,42 +79,72 @@ def safe_folder_name(name):
 # ================= PARSING =================
 def ekstrak_header(teks):
     data = {}
-    m = re.search(r"Nomor Seri Faktur Pajak:\s*(\d+)", teks)
+
+    # ---------- NOMOR SERI ----------
+    m = re.search(r"Nomor Seri Faktur Pajak\s*:\s*(\d+)", teks)
     data["nomor_seri"] = m.group(1) if m else None
 
+    # ---------- NPWP ----------
     npwp_all = re.findall(r"NPWP\s*:\s*(\d{15,16})", teks)
     data["npwp_penjual"] = npwp_all[0] if len(npwp_all) > 0 else None
     data["npwp_pembeli"] = npwp_all[1] if len(npwp_all) > 1 else None
 
-    m = re.search(r"Pengusaha Kena Pajak:\s*\n?\s*Nama\s*:\s*(.+)", teks)
+    # ---------- NAMA PENJUAL ----------
+    m = re.search(
+        r"Pengusaha Kena Pajak:\s*\n?\s*Nama\s*:\s*(.+)",
+        teks
+    )
     data["nama_penjual"] = m.group(1).strip() if m else None
 
-    m = re.search(r"Pembeli Barang Kena Pajak/Penerima Jasa Kena Pajak:\s*\n?\s*Nama\s*:\s*(.+)", teks)
+    # ---------- NAMA PEMBELI ----------
+    m = re.search(
+        r"Pembeli Barang Kena Pajak/Penerima Jasa Kena Pajak:\s*\n?\s*Nama\s*:\s*(.+)",
+        teks
+    )
     data["nama_pembeli"] = m.group(1).strip() if m else None
 
-    m = re.search(r"Pengusaha Kena Pajak:.*?Alamat\s*:\s*(.+)", teks, re.DOTALL)
+    # ---------- ALAMAT PENJUAL ----------
+    m = re.search(
+        r"Pengusaha Kena Pajak:.*?Alamat\s*:\s*(.+)",
+        teks, re.DOTALL
+    )
     data["alamat_penjual"] = m.group(1).strip().split("\n")[0] if m else None
 
-    m = re.search(r"Pembeli Barang Kena Pajak/Penerima Jasa Kena Pajak:.*?Alamat\s*:\s*(.+)", teks, re.DOTALL)
+    # ---------- ALAMAT PEMBELI ----------
+    m = re.search(
+        r"Pembeli Barang Kena Pajak/Penerima Jasa Kena Pajak:.*?Alamat\s*:\s*(.+)",
+        teks, re.DOTALL
+    )
     data["alamat_pembeli"] = m.group(1).strip().split("\n")[0] if m else None
 
+    # ---------- DPP ----------
     m = re.search(r"Dasar Pengenaan Pajak\s*([\d.,]+)", teks)
     data["dpp"] = parse_angka(m.group(1)) if m else None
 
-    m = re.search(r"Jumlah PPN[^0-9]*([\d.,]+)", teks, re.DOTALL)
+    # ---------- PPN (khusus "Jumlah PPN", bukan PPnBM) ----------
+    # \b setelah PPN supaya tidak match "PPnBM"
+    m = re.search(r"Jumlah\s+PPN\b[^0-9\n]*([\d.,]+)", teks)
     data["ppn"] = parse_angka(m.group(1)) if m else None
 
-    m = re.search(r"Jumlah\s+P+[nN]?[bB]?[mM]?[^0-9]*([\d.,]+)", teks)
+    # ---------- PPnBM (khusus "Jumlah PPnBM") ----------
+    m = re.search(r"Jumlah\s+PPn\s?BM\b[^0-9\n]*([\d.,]+)", teks)
     data["ppnbm"] = parse_angka(m.group(1)) if m else None
 
-    m = re.search(r"Harga Jual / Penggantian / Uang Muka / Termin\s*([\d.,]+)", teks)
+    # ---------- HARGA JUAL TOTAL ----------
+    m = re.search(
+        r"Harga Jual\s*/\s*Penggantian\s*/\s*Uang Muka\s*/\s*Termin\s*([\d.,]+)",
+        teks
+    )
     data["harga_jual_total"] = parse_angka(m.group(1)) if m else None
 
-    m = re.search(r"([A-Z][A-Z\.\s]+?),\s*(\d{1,2}\s+\w+\s+\d{4})", teks)
+    # ---------- TANGGAL ----------
+    m = re.search(
+        r"([A-Z][A-Z\.\s]+?),\s*(\d{1,2}\s+\w+\s+\d{4})",
+        teks
+    )
     data["tanggal"] = m.group(2) if m else None
 
     return data
-
 
 def ekstrak_barang(teks):
     items = []
