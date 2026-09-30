@@ -2,7 +2,10 @@ import streamlit as st
 import pdfplumber
 import re
 import pandas as pd
+import os
+import shutil
 from io import BytesIO
+from datetime import datetime
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -10,7 +13,37 @@ st.set_page_config(page_title="Ekstraktor Faktur Pajak", layout="wide")
 st.title("📄 Ekstraktor Faktur Pajak Indonesia")
 st.caption("Upload PDF faktur → Excel berisi Rekap + 1 sheet per faktur (Header + Detail Barang).")
 
+# ================= KONFIGURASI FOLDER =================
+BASE_UPLOAD_DIR = "uploads"
+os.makedirs(BASE_UPLOAD_DIR, exist_ok=True)
 
+st.sidebar.header("⚙️ Pengaturan Penyimpanan")
+
+mode_folder = st.sidebar.radio(
+    "📁 Mode folder PDF",
+    ["Otomatis dari nama PT", "Custom (ketik sendiri)"],
+    help="Otomatis = folder dibentuk dari nama PT penjual di faktur. "
+         "Custom = kamu tentukan sendiri path-nya.",
+)
+
+custom_folder = ""
+if mode_folder == "Custom (ketik sendiri)":
+    custom_folder = st.sidebar.text_input(
+        "Path folder",
+        value=BASE_UPLOAD_DIR,
+        help="Bisa relatif (uploads/faktur) atau absolut (D:/Faktur/SDLG).",
+    )
+    if custom_folder.strip():
+        st.sidebar.caption(f"📂 `{os.path.abspath(custom_folder.strip())}`")
+
+simpan_pdf = st.sidebar.checkbox(
+    "Simpan file PDF ke folder",
+    value=True,
+    help="Kalau dimatikan, PDF tidak disimpan (link PDF di Excel tidak akan jalan).",
+)
+
+
+# ================= UTIL =================
 def parse_angka(s):
     if not s:
         return None
@@ -36,6 +69,14 @@ def safe_sheet_name(name, used):
     return sheet
 
 
+def safe_folder_name(name):
+    """Bersihkan nama jadi nama folder yang aman."""
+    name = re.sub(r"[^\w\-]", "_", str(name))
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name[:60] or "Tanpa_Nama"
+
+
+# ================= PARSING =================
 def ekstrak_header(teks):
     data = {}
     m = re.search(r"Nomor Seri Faktur Pajak:\s*(\d+)", teks)
@@ -76,14 +117,12 @@ def ekstrak_header(teks):
 
 
 def ekstrak_barang(teks):
-    """Ekstrak barang dari format multi-baris."""
     items = []
 
-    # Buang header tabel
     teks_bersih = re.sub(r"Kode\s+Harga Jual.*?\(Rp\)", "", teks, flags=re.DOTALL)
     teks_bersih = re.sub(r"No\.?\s*Kode\s*Barang.*?Jasa Kena Pajak", "", teks_bersih, flags=re.DOTALL)
 
-    # === FORMAT A: dengan "- Part No" (SDLG style) ===
+    # FORMAT A: dengan "- Part No"
     pola = re.compile(
         r"(?P<nama>[A-Za-z][A-Za-z0-9\s\.\-/()%]*?)\s*-\s*Part No\s*:\s*(?P<part>\S+)\s*\n"
         r"\s*Rp\s*(?P<harga>[\d.,]+)\s*x\s*(?P<qty>[\d.,]+)\s*(?P<satuan>\w+)\s*\n"
@@ -105,7 +144,7 @@ def ekstrak_barang(teks):
     if items:
         return items
 
-    # === FORMAT B: tanpa "- Part No" ===
+    # FORMAT B: tanpa "- Part No"
     pola_b = re.compile(
         r"(?P<nama>[A-Z][A-Za-z0-9\s\.\-/()%]*?)\s*\n"
         r"\s*Rp\s*(?P<harga>[\d.,]+)\s*x\s*(?P<qty>[\d.,]+)\s*(?P<satuan>\w+)\s*\n"
@@ -130,15 +169,50 @@ def ekstrak_barang(teks):
     return items
 
 
-def proses_pdf(file):
+# ================= PROSES PDF =================
+def proses_pdf(file, mode="auto", custom_folder=None, base_folder=BASE_UPLOAD_DIR, simpan=True):
+    # 1. Parse dulu (biar dapat nama PT)
+    file.seek(0)
     with pdfplumber.open(file) as pdf:
         teks = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
     header = ekstrak_header(teks)
     header["nama_file"] = file.name
+    header["path_pdf"] = None
+
+    # 2. Tentukan folder
+    folder_tujuan = None
+    if simpan:
+        if mode == "custom" and custom_folder:
+            folder_tujuan = custom_folder.strip()
+        else:
+            nama_pt = header.get("nama_penjual") or "Tanpa_Nama_PT"
+            folder_tujuan = os.path.join(base_folder, safe_folder_name(nama_pt))
+
+        os.makedirs(folder_tujuan, exist_ok=True)
+
+        # Anti-overwrite
+        safe_name = re.sub(r"[^\w\-.]", "_", file.name)
+        base_name, ext = os.path.splitext(safe_name)
+        save_path = os.path.join(folder_tujuan, safe_name)
+        counter = 1
+        while os.path.exists(save_path):
+            save_path = os.path.join(folder_tujuan, f"{base_name}_{counter}{ext}")
+            counter += 1
+
+        file.seek(0)
+        with open(save_path, "wb") as f_out:
+            shutil.copyfileobj(file, f_out)
+        file.seek(0)
+
+        header["path_pdf"] = os.path.abspath(save_path)
+        header["folder_batch"] = os.path.basename(folder_tujuan)
+
     barang = ekstrak_barang(teks)
     return header, barang
 
 
+# ================= EXCEL HELPERS =================
 def pastikan_sheet(writer, sheet):
     if sheet not in writer.sheets:
         pd.DataFrame().to_excel(writer, sheet_name=sheet)
@@ -177,6 +251,15 @@ def tulis_judul(writer, sheet, text, row):
     return row + 2
 
 
+def tulis_hyperlink(writer, sheet, row, col, target, text, color="0563C1"):
+    ws = writer.sheets[sheet]
+    cell = ws.cell(row=row, column=col, value=text)
+    cell.hyperlink = target
+    cell.font = Font(color=color, underline="single")
+    return cell
+
+
+# ================= UI =================
 uploaded_files = st.file_uploader(
     "Upload file PDF faktur pajak (bisa banyak)",
     type=["pdf"], accept_multiple_files=True,
@@ -191,7 +274,13 @@ if uploaded_files:
         for i, f in enumerate(uploaded_files):
             status.text(f"Memproses: {f.name} ({i+1}/{len(uploaded_files)})")
             try:
-                h, b = proses_pdf(f)
+                h, b = proses_pdf(
+                    f,
+                    mode="custom" if mode_folder == "Custom (ketik sendiri)" else "auto",
+                    custom_folder=custom_folder,
+                    base_folder=BASE_UPLOAD_DIR,
+                    simpan=simpan_pdf,
+                )
                 hasil.append({"header": h, "barang": b})
             except Exception as e:
                 st.warning(f"Gagal memproses {f.name}: {e}")
@@ -204,6 +293,10 @@ if uploaded_files:
         c1, c2 = st.columns(2)
         c1.metric("Total Faktur", total)
         c2.metric("Total Barang", total_barang)
+
+        if simpan_pdf and hasil:
+            folders = set(h["header"].get("folder_batch") for h in hasil if h["header"].get("folder_batch"))
+            st.info(f"📁 PDF disimpan di sub-folder: {', '.join(sorted(folders))}")
 
         for r in hasil:
             h = r["header"]
@@ -246,7 +339,10 @@ if uploaded_files:
                     "PPN": h.get("ppn"),
                     "PPnBM": h.get("ppnbm"),
                     "Harga Jual Total": h.get("harga_jual_total"),
+                    "Folder": h.get("folder_batch"),
                     "Nama File": h.get("nama_file"),
+                    "Lihat Faktur": "📄 Buka",
+                    "Buka PDF": "🔗 PDF",
                 })
             df_rekap = pd.DataFrame(rekap_rows)
 
@@ -259,7 +355,10 @@ if uploaded_files:
                 "PPN": df_rekap["PPN"].sum() if not df_rekap.empty else 0,
                 "PPnBM": df_rekap["PPnBM"].sum() if not df_rekap.empty else 0,
                 "Harga Jual Total": df_rekap["Harga Jual Total"].sum() if not df_rekap.empty else 0,
+                "Folder": "",
                 "Nama File": "",
+                "Lihat Faktur": "",
+                "Buka PDF": "",
             }])
             df_rekap_full = pd.concat([df_rekap, total_row], ignore_index=True)
 
@@ -273,10 +372,12 @@ if uploaded_files:
                 ws.cell(row=2 + len(df_rekap_full), column=col).font = Font(bold=True)
 
             # ---------- 1 SHEET PER FAKTUR ----------
+            sheet_map = []
             for r in hasil:
                 h = r["header"]
                 raw_name = h.get("nomor_seri") or h.get("nama_file", "Faktur")
                 sheet = safe_sheet_name(str(raw_name), used_names)
+                sheet_map.append(sheet)
 
                 df_info = pd.DataFrame([
                     ["Nomor Seri", h.get("nomor_seri")],
@@ -312,6 +413,35 @@ if uploaded_files:
                         if cell.value:
                             max_len = max(max_len, len(str(cell.value)))
                     ws.column_dimensions[letter].width = min(max_len + 2, 60)
+
+            # ---------- HYPERLINK DI SHEET REKAP ----------
+            ws_rekap = writer.sheets[rekap_sheet]
+            header_row = 3
+            first_data_row = header_row + 1
+
+            cols = list(df_rekap_full.columns)
+            col_lihat = cols.index("Lihat Faktur") + 1
+            col_pdf = cols.index("Buka PDF") + 1
+
+            for i, (r, sheet_target) in enumerate(zip(hasil, sheet_map)):
+                row_xl = first_data_row + i
+                h = r["header"]
+
+                # Link internal ke sheet faktur
+                tulis_hyperlink(
+                    writer, rekap_sheet, row_xl, col_lihat,
+                    f"#'{sheet_target}'!A1",
+                    "📄 Buka"
+                )
+
+                # Link ke file PDF
+                pdf_path = h.get("path_pdf")
+                if pdf_path:
+                    tulis_hyperlink(
+                        writer, rekap_sheet, row_xl, col_pdf,
+                        f"file:///{pdf_path.replace(os.sep, '/')}",
+                        "🔗 PDF"
+                    )
 
         st.download_button(
             label="⬇️ Download Excel (Rekap + 1 sheet per faktur)",
